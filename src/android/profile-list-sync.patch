@@ -1,0 +1,66 @@
+diff --git a/main/src/main/java/de/blinkt/openvpn/core/ProfileManager.java b/main/src/main/java/de/blinkt/openvpn/core/ProfileManager.java
+index 0492930..dab0ec1 100644
+--- a/main/src/main/java/de/blinkt/openvpn/core/ProfileManager.java
++++ b/main/src/main/java/de/blinkt/openvpn/core/ProfileManager.java
+@@ -280,10 +280,8 @@ public class ProfileManager {
+      */
+     public synchronized void refreshVPNList(Context context)
+     {
+-        SharedPreferences listpref = Preferences.getSharedPreferencesMulti(PREFS_NAME, context);
+-        Set<String> vlist = listpref.getStringSet("vpnlist", null);
+-        if (vlist == null)
+-            return;
++        Set<String> vlist = getProfileFilesFromDisk(context);
++        vlist.add(TEMPORARY_PROFILE_FILENAME);
+ 
+         for (String vpnentry : vlist) {
+             if (!profiles.containsKey(vpnentry))
+@@ -304,11 +302,16 @@ public class ProfileManager {
+ 
+     private synchronized void loadVPNList(Context context) {
+         profiles = new HashMap<>();
++        Set<String> vlist = new HashSet<>();
+         SharedPreferences listpref = Preferences.getSharedPreferencesMulti(PREFS_NAME, context);
+-        Set<String> vlist = listpref.getStringSet("vpnlist", null);
+-        if (vlist == null) {
+-            vlist = new HashSet<>();
++        Set<String> storedList = listpref.getStringSet("vpnlist", null);
++        if (storedList != null) {
++            vlist.addAll(storedList);
+         }
++        /* SharedPreferences 的 MODE_MULTI_PROCESS 自 Android 7 起不再同步，
++         * 各进程持有各自的缓存，索引可能过期或缺失。以文件系统中的实际配置文件为准，
++         * 保证界面进程和 OpenVPN 引擎进程看到的 profile 一致。 */
++        vlist.addAll(getProfileFilesFromDisk(context));
+         // Always try to load the temporary profile
+         vlist.add(TEMPORARY_PROFILE_FILENAME);
+ 
+@@ -317,6 +320,28 @@ public class ProfileManager {
+         }
+     }
+ 
++    /**
++     * 扫描应用私有目录，返回磁盘上实际存在的 profile 文件名（去掉 .cp/.cpold/.vp 后缀）。
++     */
++    private static Set<String> getProfileFilesFromDisk(Context context) {
++        Set<String> entries = new HashSet<>();
++        String[] suffixes = {".cp", ".cpold", ".vp"};
++        File[] files = context.getFilesDir().listFiles();
++        if (files == null) {
++            return entries;
++        }
++        for (File file : files) {
++            String name = file.getName();
++            for (String suffix : suffixes) {
++                if (name.endsWith(suffix)) {
++                    entries.add(name.substring(0, name.length() - suffix.length()));
++                    break;
++                }
++            }
++        }
++        return entries;
++    }
++
+     private synchronized void loadVpnEntry(Context context, String vpnentry) {
+         ObjectInputStream vpnfile = null;
+         try {

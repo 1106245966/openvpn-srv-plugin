@@ -1,0 +1,1185 @@
+diff --git a/cmake/findcoredeps.cmake b/cmake/findcoredeps.cmake
+index cb702bd..1fa8dc0 100644
+--- a/cmake/findcoredeps.cmake
++++ b/cmake/findcoredeps.cmake
+@@ -87,7 +87,7 @@ function(add_corelibrary_dependencies target)
+                 -D_CRT_SECURE_NO_WARNINGS
+                 -DASIO_DISABLE_LOCAL_SOCKETS
+                 )
+-        set(EXTRA_LIBS fwpuclnt.lib iphlpapi.lib wininet.lib setupapi.lib rpcrt4.lib wtsapi32.lib)
++        set(EXTRA_LIBS fwpuclnt.lib iphlpapi.lib wininet.lib setupapi.lib rpcrt4.lib wtsapi32.lib dnsapi.lib)
+         if ("${CMAKE_GENERATOR_PLATFORM}" STREQUAL "ARM64")
+             # by some reasons CMake doesn't add those for ARM64
+             list(APPEND EXTRA_LIBS advapi32.lib Ole32.lib Shell32.lib)
+@@ -139,7 +139,7 @@ function(add_corelibrary_dependencies target)
+     endif()
+ 
+     if(UNIX)
+-        target_link_libraries(${target} pthread)
++        target_link_libraries(${target} pthread resolv)
+     endif()
+ 
+     target_link_libraries(${target} ${EXTRA_LIBS})
+diff --git a/openvpn/client/cliconnect.hpp b/openvpn/client/cliconnect.hpp
+index bae8b9b..a2a79e1 100644
+--- a/openvpn/client/cliconnect.hpp
++++ b/openvpn/client/cliconnect.hpp
+@@ -61,6 +61,7 @@ namespace openvpn {
+ class ClientConnect : ClientProto::NotifyCallback,
+                       RemoteList::BulkResolve::NotifyCallback,
+                       ClientLifeCycle::NotifyCallback,
++                      SRVResolvable,
+                       public RC<thread_unsafe_refcount>
+ {
+   public:
+@@ -71,7 +72,8 @@ class ClientConnect : ClientProto::NotifyCallback,
+ 
+     ClientConnect(openvpn_io::io_context &io_context_arg,
+                   const ClientOptions::Ptr &client_options_arg)
+-        : generation(0),
++        : SRVResolvable(io_context_arg),
++          generation(0),
+           halt(false),
+           paused(false),
+           client_finalized(false),
+@@ -128,6 +130,7 @@ class ClientConnect : ClientProto::NotifyCallback,
+         if (!halt)
+         {
+             halt = true;
++            srv_resolve_cancel();
+             if (bulk_resolve)
+                 bulk_resolve->cancel();
+             if (client)
+@@ -175,6 +178,7 @@ class ClientConnect : ClientProto::NotifyCallback,
+         if (!halt && !paused)
+         {
+             paused = true;
++            srv_resolve_cancel();
+             if (client)
+             {
+                 client->send_explicit_exit_notify();
+@@ -208,6 +212,7 @@ class ClientConnect : ClientProto::NotifyCallback,
+             if (seconds < 0)
+                 seconds = 0;
+             OPENVPN_LOG("Client terminated, reconnecting in " << seconds << "...");
++            srv_resolve_cancel();
+             server_poll_timer.cancel();
+             restart_wait_timer.expires_after(Time::Duration::seconds(seconds));
+             restart_wait_timer.async_wait([self = Ptr(this), gen = generation](const openvpn_io::error_code &error)
+@@ -644,6 +649,8 @@ class ClientConnect : ClientProto::NotifyCallback,
+ 
+     void new_client()
+     {
++        srv_resolve_cancel();
++
+         // Make sure generation is > 0 in case of overflow
+         if (++generation == 0)
+             ++generation;
+@@ -671,6 +678,52 @@ class ClientConnect : ClientProto::NotifyCallback,
+                 client_options->remote_reset_cache_item();
+         }
+ 
++        if (!transport_factory_relay)
++        {
++            const RemoteList::Ptr &remote_list = client_options->remote_list_ptr();
++            remote_list->reset_current_srv();
++            const RemoteList::Item::Ptr item = remote_list->current_item();
++            if (item->need_srv_resolve())
++            {
++                ClientEvent::Base::Ptr ev = new ClientEvent::Resolve();
++                client_options->events().add_event(std::move(ev));
++                srv_resolve_lock();
++                conn_timer_start(conn_timeout);
++                async_resolve_srv(item->srv_name);
++                return;
++            }
++        }
++
++        start_client();
++    }
++
++    void srv_resolve_callback(SRV::Result result) override
++    {
++        srv_resolve_cancel();
++        if (halt || paused)
++            return;
++
++        const RemoteList::Ptr &remote_list = client_options->remote_list_ptr();
++        const RemoteList::Item::Ptr item = remote_list->current_item();
++        SRV::Record selected;
++        if (result.error.empty() && remote_list->select_srv(result.records, selected))
++        {
++            item->set_srv_target(selected);
++            OPENVPN_LOG_REMOTELIST("*** ClientConnect SRV SELECT " << item->to_string());
++            start_client();
++            return;
++        }
++
++        if (result.error.empty())
++            result.error = "no usable SRV records";
++        OPENVPN_LOG("DNS SRV resolve error on " << item->srv_name
++                                                << ": " << result.error);
++        client_options->stats().error(Error::RESOLVE_ERROR);
++        queue_restart();
++    }
++
++    void start_client()
++    {
+         // client_config in cliopt.hpp
+         const Client::Config::Ptr cli_config = client_options->client_config(!transport_factory_relay);
+         client.reset(new Client(io_context, *cli_config, this)); // build ClientProto::Session from cliproto.hpp
+diff --git a/openvpn/client/cliopt.hpp b/openvpn/client/cliopt.hpp
+index 044e7c2..f875715 100644
+--- a/openvpn/client/cliopt.hpp
++++ b/openvpn/client/cliopt.hpp
+@@ -1249,6 +1249,11 @@ class ClientOptions : public RC<thread_unsafe_refcount>
+         return asio_work_always_on_;
+     }
+ 
++    const RemoteList::Ptr &remote_list_ptr() const
++    {
++        return remote_list;
++    }
++
+     RemoteList::Ptr remote_list_precache() const
+     {
+         RemoteList::Ptr r;
+diff --git a/openvpn/client/remotelist.hpp b/openvpn/client/remotelist.hpp
+index 0c9a59d..0a8d96b 100644
+--- a/openvpn/client/remotelist.hpp
++++ b/openvpn/client/remotelist.hpp
+@@ -40,6 +40,7 @@
+ #include <openvpn/client/cliconstants.hpp>
+ #include <openvpn/log/sessionstats.hpp>
+ #include <openvpn/client/async_resolve.hpp>
++#include <openvpn/client/srvresolve.hpp>
+ 
+ #if OPENVPN_DEBUG_REMOTELIST >= 1
+ #define OPENVPN_LOG_REMOTELIST(x) OPENVPN_LOG(x)
+@@ -120,6 +121,12 @@ class RemoteList : public RC<thread_unsafe_refcount>
+         // Non-empty if --remote-random-hostname is active.
+         std::string random_host;
+ 
++        // SRV query name and the target selected for this connection attempt.
++        std::string srv_name;
++        std::string srv_target;
++        std::string srv_port;
++        std::string port_override;
++
+         // IP address list defined after actual_host() is resolved
+         ResolvedAddrList::Ptr res_addr_list;
+ 
+@@ -136,7 +143,46 @@ class RemoteList : public RC<thread_unsafe_refcount>
+ 
+         std::string actual_host() const
+         {
+-            return random_host.empty() ? server_host : random_host;
++            if (!random_host.empty())
++                return random_host;
++            return srv_target.empty() ? server_host : srv_target;
++        }
++
++        std::string actual_port() const
++        {
++            if (!port_override.empty())
++                return port_override;
++            return srv_port.empty() ? server_port : srv_port;
++        }
++
++        bool is_srv() const
++        {
++            return !srv_name.empty();
++        }
++
++        bool need_srv_resolve() const
++        {
++            return is_srv() && (srv_target.empty() || decay_time <= time(nullptr));
++        }
++
++        void reset_srv()
++        {
++            if (!is_srv())
++                return;
++            srv_target.clear();
++            srv_port.clear();
++            random_host.clear();
++            res_addr_list.reset();
++            decay_time = std::numeric_limits<std::time_t>::max();
++        }
++
++        void set_srv_target(const SRV::Record &record)
++        {
++            srv_target = record.target;
++            srv_port = std::to_string(record.port);
++            random_host.clear();
++            res_addr_list.reset();
++            decay_time = std::numeric_limits<std::time_t>::max();
+         }
+ 
+         // cache a single IP address
+@@ -194,25 +240,27 @@ class RemoteList : public RC<thread_unsafe_refcount>
+             if (res_addr_list && index < res_addr_list->size())
+             {
+                 endpoint.address((*res_addr_list)[index]->addr.to_asio());
+-                endpoint.port(parse_number_throw<unsigned short>(server_port, "remote_port"));
++                endpoint.port(parse_number_throw<unsigned short>(actual_port(), "remote_port"));
+                 OPENVPN_LOG_REMOTELIST("*** RemoteList::Item endpoint GET[" << index << "] " << endpoint << ' ' << to_string());
+                 return true;
+             }
+             return false;
+         }
+ 
+-        bool need_resolve()
++        bool need_resolve() const
+         {
+-            return !res_addr_list || decay_time <= time(nullptr);
++            return need_srv_resolve() || !res_addr_list || decay_time <= time(nullptr);
+         }
+ 
+         std::string to_string() const
+         {
+             std::ostringstream out;
+             out << "host=" << actual_host();
++            if (is_srv())
++                out << " srv=" << srv_name;
+             if (res_addr_list)
+                 out << '[' << res_addr_list->to_string() << ']';
+-            out << " port=" << server_port
++            out << " port=" << actual_port()
+                 << " proto=" << transport_protocol.str();
+             return out.str();
+         }
+@@ -236,6 +284,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+ 
+         const std::string connection;
+         const std::string remote = "remote";
++        const std::string remote_srv = "remote-srv";
+         const std::string proto = "proto";
+         const std::string port = "port";
+     };
+@@ -296,7 +345,9 @@ class RemoteList : public RC<thread_unsafe_refcount>
+     // to pre-resolve all potential remote server items prior
+     // to initial tunnel establishment. Also used when trying to
+     // re-resolve items which had too many failed attempts.
+-    class BulkResolve : public virtual RC<thread_unsafe_refcount>, protected AsyncResolvableTCP
++    class BulkResolve : public virtual RC<thread_unsafe_refcount>,
++                        protected AsyncResolvableTCP,
++                        protected SRVResolvable
+     {
+       public:
+         using Ptr = RCPtr<BulkResolve>;
+@@ -313,6 +364,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+                     const RemoteList::Ptr &remote_list_arg,
+                     const SessionStats::Ptr &stats_arg)
+             : AsyncResolvableTCP(io_context_arg),
++              SRVResolvable(io_context_arg),
+               notify_callback(nullptr),
+               remote_list(remote_list_arg),
+               stats(stats_arg),
+@@ -350,6 +402,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+             notify_callback = nullptr;
+             index = 0;
+             async_resolve_cancel();
++            srv_resolve_cancel();
+         }
+ 
+       protected:
+@@ -359,11 +412,18 @@ class RemoteList : public RC<thread_unsafe_refcount>
+             {
+                 // try to resolve item if needed
+                 auto &item = remote_list->list[index];
++                if (item->need_srv_resolve())
++                {
++                    OPENVPN_LOG_REMOTELIST("*** BulkResolve SRV RESOLVE on " << item->to_string());
++                    srv_resolve_lock();
++                    async_resolve_srv(item->srv_name);
++                    return;
++                }
+                 if (item->need_resolve())
+                 {
+                     // next item to resolve
+                     OPENVPN_LOG_REMOTELIST("*** BulkResolve RESOLVE on " << item->to_string());
+-                    async_resolve_name(item->actual_host(), item->server_port);
++                    async_resolve_name(item->actual_host(), item->actual_port());
+                     return;
+                 }
+                 ++index;
+@@ -382,6 +442,41 @@ class RemoteList : public RC<thread_unsafe_refcount>
+             }
+         }
+ 
++        void srv_resolve_callback(SRV::Result result) override
++        {
++            srv_resolve_cancel();
++            if (!notify_callback || index >= remote_list->list.size())
++                return;
++
++            const auto item = remote_list->list[index];
++            if (!result.error.empty())
++            {
++                OPENVPN_LOG("DNS SRV bulk-resolve error on " << item->srv_name
++                                                             << ": " << result.error);
++                if (stats)
++                    stats->error(Error::RESOLVE_ERROR);
++                ++index;
++                resolve_next();
++                return;
++            }
++
++            SRV::Record selected;
++            if (!remote_list->select_srv(result.records, selected))
++            {
++                OPENVPN_LOG("DNS SRV bulk-resolve error on " << item->srv_name
++                                                             << ": no usable SRV records");
++                if (stats)
++                    stats->error(Error::RESOLVE_ERROR);
++                ++index;
++                resolve_next();
++                return;
++            }
++
++            item->set_srv_target(selected);
++            OPENVPN_LOG_REMOTELIST("*** BulkResolve SRV SELECT " << item->to_string());
++            async_resolve_name(item->actual_host(), item->actual_port());
++        }
++
+         // callback on resolve completion
+         void resolve_callback(const openvpn_io::error_code &error,
+                               results_type results) override
+@@ -398,8 +493,8 @@ class RemoteList : public RC<thread_unsafe_refcount>
+                     for (auto &item : remote_list->list)
+                     {
+                         // Skip already resolved and items with different hostname
+-                        if (!item->need_resolve()
+-                            || item->server_host != resolve_item->server_host)
++                        if (!item->need_resolve() || item->need_srv_resolve()
++                            || item->actual_host() != resolve_item->actual_host())
+                             continue;
+ 
+                         // Reset item's address index as the list changes
+@@ -555,6 +650,8 @@ class RemoteList : public RC<thread_unsafe_refcount>
+             return;
+         for (auto &item : list)
+         {
++            item->reset_srv();
++            item->srv_name.clear();
+             item->server_host = server_override;
+             item->random_host.clear();
+             item->res_addr_list.reset();
+@@ -571,6 +668,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+         for (auto &item : list)
+         {
+             item->server_port = port_override;
++            item->port_override = port_override;
+             item->res_addr_list.reset();
+         }
+         reset_cache();
+@@ -651,7 +749,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+         if (server_host)
+             *server_host = item.actual_host();
+         if (server_port)
+-            *server_port = item.server_port;
++            *server_port = item.actual_port();
+         const bool cached = (item.res_addr_list && index.item_addr() < item.res_addr_list->size());
+         if (transport_protocol)
+         {
+@@ -697,6 +795,24 @@ class RemoteList : public RC<thread_unsafe_refcount>
+         return list.at(index);
+     }
+ 
++    Item::Ptr current_item() const
++    {
++        return list[item_index()];
++    }
++
++    bool select_srv(const std::vector<SRV::Record> &records, SRV::Record &selected) const
++    {
++        const std::uint32_t random_value = rng ? rng->rand_get_positive<std::uint32_t>() : 0;
++        return SRV::select(records, random_value, selected);
++    }
++
++    // Without the remote cache, every new Client gets a fresh SRV selection.
++    void reset_current_srv()
++    {
++        if (!enable_cache)
++            list[item_index()]->reset_srv();
++    }
++
+     // return hostname (or IP address) of current connection entry
+     std::string current_server_host() const
+     {
+@@ -752,6 +868,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+     {
+         for (auto &e : list)
+         {
++            e->reset_srv();
+             e->res_addr_list.reset(nullptr);
+             randomize_host(*e);
+         }
+@@ -790,6 +907,7 @@ class RemoteList : public RC<thread_unsafe_refcount>
+     {
+         if (i < list.size())
+         {
++            list[i]->reset_srv();
+             list[i]->res_addr_list.reset(nullptr);
+             list[i]->decay_time = std::numeric_limits<std::time_t>::max();
+             randomize_host(*list[i]);
+@@ -910,41 +1028,77 @@ class RemoteList : public RC<thread_unsafe_refcount>
+ 
+     void add(const OptionList &opt, const Protocol &default_proto, const std::string &default_port, ConnBlock::Ptr conn_block)
+     {
+-        const OptionList::IndexList *rem = opt.get_index_ptr(directives.remote);
+-        if (!rem)
+-            return;
+-
+-        // cycle through remote entries
+-        for (const auto &i : *rem)
++        // Walk the option list directly to preserve remote/remote-srv ordering.
++        for (size_t i = 0; i < opt.size(); ++i)
+         {
+-            Item::Ptr e(new Item());
+             const Option &o = opt[i];
+-            o.touch();
+-            e->server_host = o.get(1, 256);
+-            int adj = 0;
+-            if (o.size() >= 3)
++            if (o.empty())
++                continue;
++            if (o.ref(0) == directives.remote)
++                add_remote(o, default_proto, default_port, conn_block);
++            else if (o.ref(0) == directives.remote_srv)
++                add_srv(o, default_proto, default_port, conn_block);
++        }
++    }
++
++    void add_remote(const Option &o,
++                    const Protocol &default_proto,
++                    const std::string &default_port,
++                    const ConnBlock::Ptr &conn_block)
++    {
++        Item::Ptr e(new Item());
++        o.touch();
++        e->server_host = o.get(1, 256);
++        int adj = 0;
++        if (o.size() >= 3)
++        {
++            e->server_port = o.get(2, 16);
++            if (Protocol::is_local_type(e->server_port))
+             {
+-                e->server_port = o.get(2, 16);
+-                if (Protocol::is_local_type(e->server_port))
+-                {
+-                    adj = -1;
+-                    e->server_port = "";
+-                }
+-                else
+-                    HostPort::validate_port(e->server_port, directives.port);
++                adj = -1;
++                e->server_port = "";
+             }
+             else
+-                e->server_port = default_port;
+-            if (o.size() >= (size_t)(4 + adj))
+-                e->transport_protocol = Protocol::parse(o.get(3 + adj, 16), Protocol::CLIENT_SUFFIX);
+-            else
+-                e->transport_protocol = default_proto;
+-            e->conn_block = conn_block;
+-            randomize_host(*e);
+-            if (conn_block)
+-                conn_block->new_item(*e);
+-            list.push_back(e);
++                HostPort::validate_port(e->server_port, directives.port);
+         }
++        else
++            e->server_port = default_port;
++        if (o.size() >= (size_t)(4 + adj))
++            e->transport_protocol = Protocol::parse(o.get(3 + adj, 16), Protocol::CLIENT_SUFFIX);
++        else
++            e->transport_protocol = default_proto;
++        e->conn_block = conn_block;
++        randomize_host(*e);
++        if (conn_block)
++            conn_block->new_item(*e);
++        list.push_back(e);
++    }
++
++    void add_srv(const Option &o,
++                 const Protocol &default_proto,
++                 const std::string &default_port,
++                 const ConnBlock::Ptr &conn_block)
++    {
++        o.touch();
++        o.exact_args(2);
++
++        Item::Ptr e(new Item());
++        e->srv_name = o.get(1, 256);
++        e->server_host = e->srv_name;
++        e->server_port = default_port;
++        e->transport_protocol = SRV::protocol_from_name(e->srv_name);
++        if (!e->transport_protocol.defined())
++            OPENVPN_THROW_ARG1(option_error,
++                               ERR_INVALID_OPTION_VAL,
++                               "remote-srv requires _service._tcp.name or _service._udp.name");
++        if (default_proto.is_ipv4())
++            e->transport_protocol.mod_addr_version(IP::Addr::V4);
++        else if (default_proto.is_ipv6())
++            e->transport_protocol.mod_addr_version(IP::Addr::V6);
++        e->conn_block = conn_block;
++        if (conn_block)
++            conn_block->new_item(*e);
++        list.push_back(e);
+     }
+ 
+     void unsupported_in_connection_block(const OptionList &options, const std::string &option)
+@@ -955,6 +1109,11 @@ class RemoteList : public RC<thread_unsafe_refcount>
+ 
+     void randomize_host(Item &item)
+     {
++        if (item.is_srv())
++        {
++            item.random_host.clear();
++            return;
++        }
+         if (!random_hostname || !rng)
+             return;
+ 
+diff --git a/openvpn/client/srvresolve.hpp b/openvpn/client/srvresolve.hpp
+new file mode 100644
+index 0000000..739f9c9
+--- /dev/null
++++ b/openvpn/client/srvresolve.hpp
+@@ -0,0 +1,449 @@
++//    OpenVPN -- An application to securely tunnel IP networks
++//               over a single port, with support for SSL/TLS-based
++//               session authentication and key exchange,
++//               packet encryption, packet authentication, and
++//               packet compression.
++//
++//    Copyright (C) 2012- OpenVPN Inc.
++//
++//    SPDX-License-Identifier: MPL-2.0 OR AGPL-3.0-only WITH openvpn3-openssl-exception
++//
++
++#ifndef OPENVPN_CLIENT_SRVRESOLVE_H
++#define OPENVPN_CLIENT_SRVRESOLVE_H
++
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <openvpn/io/io.hpp>
++#include <openvpn/asio/asiowork.hpp>
++#include <openvpn/common/bigmutex.hpp>
++#include <openvpn/common/platform.hpp>
++#include <openvpn/common/rc.hpp>
++#include <openvpn/common/string.hpp>
++#include <openvpn/transport/protocol.hpp>
++
++#ifdef OPENVPN_PLATFORM_WIN
++#include <windows.h>
++#include <windns.h>
++#include <openvpn/common/wstring.hpp>
++#else
++#include <resolv.h>
++#endif
++
++namespace openvpn::SRV {
++struct Record
++{
++    std::uint16_t priority = 0;
++    std::uint16_t weight = 0;
++    std::uint16_t port = 0;
++    std::string target;
++};
++
++struct Result
++{
++    std::vector<Record> records;
++    std::string error;
++};
++
++inline Protocol protocol_from_name(const std::string &name)
++{
++    const size_t first = name.find('.');
++    if (first == std::string::npos || first < 2 || name[0] != '_')
++        return Protocol();
++
++    const size_t second = name.find('.', first + 1);
++    if (second == std::string::npos || second + 1 >= name.size())
++        return Protocol();
++
++    const std::string proto = name.substr(first + 1, second - first - 1);
++    if (string::strcasecmp(proto, "_tcp") == 0)
++        return Protocol(Protocol::TCP);
++    if (string::strcasecmp(proto, "_udp") == 0)
++        return Protocol(Protocol::UDP);
++    return Protocol();
++}
++
++// Select one usable record from the lowest-priority group.  random_value is
++// supplied by the caller so the thread-unsafe client RNG stays on the I/O thread.
++inline bool select(const std::vector<Record> &records,
++                   const std::uint32_t random_value,
++                   Record &selected)
++{
++    std::vector<const Record *> candidates;
++    std::uint16_t min_priority = 0;
++    bool have_priority = false;
++
++    for (const auto &record : records)
++    {
++        if (record.target.empty() || record.target == "." || record.port == 0)
++            continue;
++        if (!have_priority || record.priority < min_priority)
++        {
++            min_priority = record.priority;
++            have_priority = true;
++        }
++    }
++    if (!have_priority)
++        return false;
++
++    std::uint32_t total_weight = 0;
++    for (const auto &record : records)
++    {
++        if (record.priority == min_priority
++            && !record.target.empty() && record.target != "." && record.port != 0)
++        {
++            candidates.push_back(&record);
++            total_weight += record.weight;
++        }
++    }
++
++    if (total_weight == 0)
++    {
++        selected = *candidates[random_value % candidates.size()];
++        return true;
++    }
++
++    std::uint32_t pick = random_value % total_weight;
++    for (const auto *record : candidates)
++    {
++        if (pick < record->weight)
++        {
++            selected = *record;
++            return true;
++        }
++        pick -= record->weight;
++    }
++    return false;
++}
++
++namespace detail {
++inline std::uint16_t read_u16(const unsigned char *p)
++{
++    return static_cast<std::uint16_t>((p[0] << 8) | p[1]);
++}
++
++inline const unsigned char *skip_name(const unsigned char *end,
++                                      const unsigned char *p)
++{
++    while (p < end)
++    {
++        const unsigned char c = *p;
++        if (c == 0)
++            return p + 1;
++        if ((c & 0xc0) == 0xc0)
++            return p + 2 <= end ? p + 2 : nullptr;
++        if ((c & 0xc0) != 0 || p + 1 + c > end)
++            return nullptr;
++        p += 1 + c;
++    }
++    return nullptr;
++}
++
++inline bool decode_name(const unsigned char *msg,
++                        const unsigned char *end,
++                        const unsigned char *p,
++                        std::string &out)
++{
++    unsigned int jumps = 0;
++    bool appended = false;
++
++    while (p < end)
++    {
++        const unsigned char c = *p;
++        if (c == 0)
++            return true;
++        if ((c & 0xc0) == 0xc0)
++        {
++            if (p + 2 > end || ++jumps > 32)
++                return false;
++            const size_t offset = ((c & 0x3f) << 8) | p[1];
++            if (msg + offset >= end)
++                return false;
++            p = msg + offset;
++            continue;
++        }
++        if ((c & 0xc0) != 0 || p + 1 + c > end)
++            return false;
++        if (out.size() + c + (appended ? 1 : 0) >= 256)
++            return false;
++        if (appended)
++            out += '.';
++        out.append(reinterpret_cast<const char *>(p + 1), c);
++        appended = true;
++        p += 1 + c;
++    }
++    return false;
++}
++
++inline void normalize_target(std::string &target)
++{
++    if (target.size() > 1 && target.back() == '.')
++        target.pop_back();
++}
++} // namespace detail
++
++// Parse a DNS response without depending on platform-specific nameser APIs.
++inline Result parse_response(const unsigned char *msg, const size_t len)
++{
++    Result result;
++    if (!msg || len < 12)
++    {
++        result.error = "short DNS response";
++        return result;
++    }
++    if ((msg[2] & 0x02) != 0)
++    {
++        result.error = "truncated DNS response";
++        return result;
++    }
++    if ((msg[3] & 0x0f) != 0)
++    {
++        result.error = "DNS server returned an error";
++        return result;
++    }
++
++    const unsigned char *p = msg + 12;
++    const unsigned char *end = msg + len;
++    const unsigned int qdcount = detail::read_u16(msg + 4);
++    const unsigned int ancount = detail::read_u16(msg + 6);
++
++    for (unsigned int i = 0; i < qdcount; ++i)
++    {
++        p = detail::skip_name(end, p);
++        if (!p || p + 4 > end)
++        {
++            result.error = "invalid DNS question section";
++            return result;
++        }
++        p += 4;
++    }
++
++    for (unsigned int i = 0; i < ancount; ++i)
++    {
++        p = detail::skip_name(end, p);
++        if (!p || p + 10 > end)
++        {
++            result.error = "invalid DNS answer section";
++            return result;
++        }
++
++        const std::uint16_t type = detail::read_u16(p);
++        const std::uint16_t dns_class = detail::read_u16(p + 2);
++        const std::uint16_t rdlength = detail::read_u16(p + 8);
++        const unsigned char *rdata = p + 10;
++        if (rdata + rdlength > end)
++        {
++            result.error = "invalid DNS record length";
++            return result;
++        }
++        p = rdata + rdlength;
++
++        if (type != 33 || dns_class != 1 || rdlength < 7)
++            continue;
++
++        Record record;
++        record.priority = detail::read_u16(rdata);
++        record.weight = detail::read_u16(rdata + 2);
++        record.port = detail::read_u16(rdata + 4);
++        if (!detail::decode_name(msg, end, rdata + 6, record.target))
++        {
++            result.error = "invalid SRV target name";
++            return result;
++        }
++        detail::normalize_target(record.target);
++        result.records.push_back(std::move(record));
++    }
++
++    if (result.records.empty())
++        result.error = "DNS response contains no SRV records";
++    return result;
++}
++
++inline Result query(const std::string &name)
++{
++    Result result;
++    if (!protocol_from_name(name).defined())
++    {
++        result.error = "SRV name must contain _tcp or _udp and a domain name";
++        return result;
++    }
++
++#ifdef OPENVPN_PLATFORM_WIN
++    try
++    {
++        const std::wstring wide_name = wstring::from_utf8(name);
++        PDNS_RECORD raw_records = nullptr;
++        const DNS_STATUS status = DnsQuery_W(wide_name.c_str(),
++                                             DNS_TYPE_SRV,
++                                             DNS_QUERY_STANDARD,
++                                             nullptr,
++                                             &raw_records,
++                                             nullptr);
++        if (status != ERROR_SUCCESS)
++        {
++            result.error = "DnsQuery_W failed with status " + std::to_string(status);
++            return result;
++        }
++
++        struct RecordGuard
++        {
++            PDNS_RECORD records;
++            ~RecordGuard()
++            {
++                if (records)
++                    DnsRecordListFree(records, DnsFreeRecordList);
++            }
++        } guard{raw_records};
++
++        // DnsQuery_W returns wide records even when PDNS_RECORD maps to the
++        // narrow structure in builds that do not define UNICODE.
++        for (PDNS_RECORDW current = reinterpret_cast<PDNS_RECORDW>(raw_records);
++             current;
++             current = current->pNext)
++        {
++            if (current->wType != DNS_TYPE_SRV)
++                continue;
++            Record record;
++            record.priority = current->Data.SRV.wPriority;
++            record.weight = current->Data.SRV.wWeight;
++            record.port = current->Data.SRV.wPort;
++            record.target = wstring::to_utf8(current->Data.SRV.pNameTarget);
++            detail::normalize_target(record.target);
++            result.records.push_back(std::move(record));
++        }
++        if (result.records.empty())
++            result.error = "DNS response contains no SRV records";
++    }
++    catch (const std::exception &e)
++    {
++        result.records.clear();
++        result.error = e.what();
++    }
++#else
++    unsigned char answer[4096];
++    const int len = res_query(name.c_str(), 1, 33, answer, sizeof(answer));
++    if (len < 0)
++    {
++        result.error = "res_query failed";
++        return result;
++    }
++    result = parse_response(answer, static_cast<size_t>(len));
++#endif
++    return result;
++}
++} // namespace openvpn::SRV
++
++namespace openvpn {
++// Detached synchronous system query with an I/O-thread completion callback.
++// Cancellation detaches the worker, matching AsyncResolvable's DNS semantics.
++class SRVResolvable
++{
++    class ResolveThread : public RC<thread_safe_refcount>
++    {
++        using Ptr = RCPtr<ResolveThread>;
++
++        openvpn_io::io_context &io_context;
++        SRVResolvable *parent;
++        std::atomic<bool> detached{false};
++
++        ResolveThread(openvpn_io::io_context &io_context_arg,
++                      SRVResolvable *parent_arg,
++                      const std::string &name)
++            : io_context(io_context_arg), parent(parent_arg)
++        {
++            std::thread thread([self = Ptr(this), name]()
++                               {
++                                   SRV::Result result;
++                                   try
++                                   {
++                                       result = SRV::query(name);
++                                   }
++                                   catch (const std::exception &e)
++                                   {
++                                       result.error = e.what();
++                                   }
++                                   catch (...)
++                                   {
++                                       result.error = "unknown SRV resolver error";
++                                   }
++                                   if (!self->is_detached())
++                                       self->post_callback(std::move(result)); });
++            thread.detach();
++        }
++
++        void detach()
++        {
++            detached.store(true, std::memory_order_relaxed);
++            parent = nullptr;
++        }
++
++        bool is_detached() const
++        {
++            return detached.load(std::memory_order_relaxed);
++        }
++
++        void post_callback(SRV::Result result)
++        {
++            openvpn_io::post(io_context,
++                             [self = Ptr(this), result = std::move(result)]() mutable
++                             {
++                                 SRVResolvable *parent = self->parent;
++                                 if (!self->is_detached() && parent)
++                                 {
++                                     self->detach();
++                                     OPENVPN_ASYNC_HANDLER;
++                                     parent->srv_resolve_callback(std::move(result));
++                                 }
++                             });
++        }
++
++        friend class SRVResolvable;
++    };
++
++    openvpn_io::io_context &io_context;
++    std::unique_ptr<AsioWork> asio_work;
++    RCPtr<ResolveThread> resolve_thread;
++
++  public:
++    explicit SRVResolvable(openvpn_io::io_context &io_context_arg)
++        : io_context(io_context_arg)
++    {
++    }
++
++    virtual ~SRVResolvable()
++    {
++        srv_resolve_cancel();
++    }
++
++    virtual void srv_resolve_callback(SRV::Result result) = 0;
++
++    virtual void async_resolve_srv(const std::string &name)
++    {
++        resolve_thread.reset(new ResolveThread(io_context, this, name));
++    }
++
++    void srv_resolve_lock()
++    {
++        asio_work.reset(new AsioWork(io_context));
++    }
++
++    void srv_resolve_cancel()
++    {
++        if (resolve_thread)
++        {
++            resolve_thread->detach();
++            resolve_thread.reset();
++        }
++        asio_work.reset();
++    }
++};
++} // namespace openvpn
++
++#endif // OPENVPN_CLIENT_SRVRESOLVE_H
+diff --git a/test/unittests/test_remotelist.cpp b/test/unittests/test_remotelist.cpp
+index 09efb50..772407c 100644
+--- a/test/unittests/test_remotelist.cpp
++++ b/test/unittests/test_remotelist.cpp
+@@ -598,3 +598,180 @@ TEST(RemoteList, OverrideFunctions)
+     ASSERT_EQ(rl.size(), 1UL);
+     ASSERT_EQ(rl.current_server_host(), "override.host.invalid");
+ }
++
++
++TEST(RemoteList, SRVConfig)
++{
++    OptionList cfg;
++    cfg.parse_from_config(
++        "remote-random-hostname\n"
++        "remote plain.invalid 1111 udp\n"
++        "remote-srv _openvpn._tcp.vpn.example.com\n"
++        "<connection>\n"
++        "  proto udp6\n"
++        "  remote-srv _openvpn._udp.vpn.example.com\n"
++        "</connection>\n",
++        nullptr);
++    cfg.update_map();
++
++    const RandomAPI::Ptr rng(new FakeSecureRand(0xf7));
++    RemoteList rl(cfg, "", 0, nullptr, rng);
++    ASSERT_EQ(rl.size(), 3UL);
++    ASSERT_FALSE(rl.get_item(0)->is_srv());
++    ASSERT_EQ(rl.get_item(1)->srv_name, "_openvpn._tcp.vpn.example.com");
++    ASSERT_EQ(rl.get_item(1)->transport_protocol, Protocol(Protocol::TCPv4));
++    ASSERT_EQ(rl.get_item(1)->actual_host(), "_openvpn._tcp.vpn.example.com");
++    ASSERT_TRUE(rl.get_item(1)->random_host.empty());
++    ASSERT_EQ(rl.get_item(2)->srv_name, "_openvpn._udp.vpn.example.com");
++    ASSERT_EQ(rl.get_item(2)->transport_protocol, Protocol(Protocol::UDPv6));
++
++    rl.next();
++    SRV::Record record{10, 1, 4443, "vpn1.example.com"};
++    rl.current_item()->set_srv_target(record);
++    ASSERT_EQ(rl.current_server_host(), "vpn1.example.com");
++    ASSERT_EQ(rl.current_item()->actual_port(), "4443");
++    ASSERT_FALSE(rl.current_item()->need_srv_resolve());
++    rl.reset_current_srv();
++    ASSERT_TRUE(rl.current_item()->need_srv_resolve());
++    ASSERT_EQ(rl.current_server_host(), "_openvpn._tcp.vpn.example.com");
++}
++
++
++TEST(RemoteList, SRVConfigInvalid)
++{
++    OptionList bad_proto;
++    bad_proto.parse_from_config("remote-srv _openvpn._sctp.vpn.example.com\n", nullptr);
++    bad_proto.update_map();
++    ASSERT_THROW(RemoteList(bad_proto, "", 0, nullptr, nullptr), option_error);
++
++    OptionList extra_arg;
++    extra_arg.parse_from_config("remote-srv _openvpn._udp.vpn.example.com 1194\n", nullptr);
++    extra_arg.update_map();
++    ASSERT_THROW(RemoteList(extra_arg, "", 0, nullptr, nullptr), option_error);
++}
++
++
++TEST(SRVResolve, SelectByPriorityAndWeight)
++{
++    const std::vector<SRV::Record> records{
++        {0, 100, 1, "."},
++        {5, 100, 0, "invalid-port.example.com"},
++        {10, 1, 443, "vpn1.example.com"},
++        {10, 3, 8443, "vpn2.example.com"},
++        {20, 100, 9443, "vpn3.example.com"},
++    };
++
++    SRV::Record selected;
++    ASSERT_TRUE(SRV::select(records, 0, selected));
++    ASSERT_EQ(selected.target, "vpn1.example.com");
++    ASSERT_TRUE(SRV::select(records, 1, selected));
++    ASSERT_EQ(selected.target, "vpn2.example.com");
++    ASSERT_EQ(selected.port, 8443);
++    ASSERT_TRUE(SRV::select(records, 3, selected));
++    ASSERT_EQ(selected.target, "vpn2.example.com");
++
++    const std::vector<SRV::Record> zero_weights{
++        {10, 0, 443, "vpn1.example.com"},
++        {10, 0, 8443, "vpn2.example.com"},
++    };
++    ASSERT_TRUE(SRV::select(zero_weights, 1, selected));
++    ASSERT_EQ(selected.target, "vpn2.example.com");
++
++    ASSERT_FALSE(SRV::select({}, 0, selected));
++    ASSERT_FALSE(SRV::select({{0, 0, 443, "."}}, 0, selected));
++}
++
++
++TEST(SRVResolve, ParseCompressedResponse)
++{
++    const std::vector<unsigned char> response{
++        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
++        0x08, '_', 'o', 'p', 'e', 'n', 'v', 'p', 'n',
++        0x04, '_', 'u', 'd', 'p',
++        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
++        0x03, 'c', 'o', 'm', 0x00,
++        0x00, 0x21, 0x00, 0x01,
++        0xc0, 0x0c, 0x00, 0x21, 0x00, 0x01,
++        0x00, 0x00, 0x00, 0x3c, 0x00, 0x0d,
++        0x00, 0x0a, 0x00, 0x05, 0x04, 0xaa,
++        0x04, 'v', 'p', 'n', '1', 0xc0, 0x1a,
++    };
++
++    const SRV::Result result = SRV::parse_response(response.data(), response.size());
++    ASSERT_TRUE(result.error.empty()) << result.error;
++    ASSERT_EQ(result.records.size(), 1UL);
++    ASSERT_EQ(result.records[0].priority, 10);
++    ASSERT_EQ(result.records[0].weight, 5);
++    ASSERT_EQ(result.records[0].port, 1194);
++    ASSERT_EQ(result.records[0].target, "vpn1.example.com");
++}
++
++
++TEST(RemoteList, SRVBulkResolve)
++{
++    class FakeBulkResolveWithSRV
++        : public FakeAsyncResolvable<RemoteList::BulkResolve,
++                                     openvpn_io::io_context &,
++                                     const RemoteList::Ptr &,
++                                     const SessionStats::Ptr &>
++    {
++        using Base = FakeAsyncResolvable<RemoteList::BulkResolve,
++                                         openvpn_io::io_context &,
++                                         const RemoteList::Ptr &,
++                                         const SessionStats::Ptr &>;
++
++      public:
++        using Base::Base;
++
++        void async_resolve_srv(const std::string &name) override
++        {
++            SRV::Result result;
++            result.error = "no fake SRV result";
++            const auto it = srv_results.find(name);
++            if (it != srv_results.end())
++                result = it->second;
++            this->srv_resolve_callback(std::move(result));
++        }
++
++        std::map<std::string, SRV::Result> srv_results;
++    };
++
++    OptionList cfg;
++    cfg.parse_from_config(
++        "remote-random-hostname\n"
++        "remote-cache-lifetime 60\n"
++        "remote-srv _openvpn._udp.vpn.example.com\n",
++        nullptr);
++    cfg.update_map();
++
++    const RandomAPI::Ptr rng(new FakeSecureRand(0xf7));
++    const RemoteList::Ptr rl(new RemoteList(cfg, "", 0, nullptr, rng));
++    rl->set_enable_cache(true);
++
++    openvpn_io::io_context ioctx;
++    const SessionStats::Ptr stats(new SessionStats());
++    FakeBulkResolveWithSRV fake_bulkres(ioctx, rl, stats);
++    SRV::Result srv_result;
++    srv_result.records.push_back({10, 0, 8443, "vpn1.example.com"});
++    fake_bulkres.srv_results["_openvpn._udp.vpn.example.com"] = srv_result;
++    fake_bulkres.set_results("vpn1.example.com", "8443", {{"192.0.2.1", 8443}});
++
++    BulkResolveNotifyIgn notify;
++    fake_bulkres.start(&notify);
++
++    const auto item = rl->current_item();
++    ASSERT_EQ(item->actual_host(), "vpn1.example.com");
++    ASSERT_EQ(item->actual_port(), "8443");
++    ASSERT_TRUE(item->random_host.empty());
++    ASSERT_TRUE(item->res_addr_list_defined());
++    const auto endpoint = fake_bulkres.init_endpoint();
++    auto mutable_endpoint = endpoint;
++    rl->get_endpoint(mutable_endpoint);
++    ASSERT_EQ(mutable_endpoint.address().to_string(), "192.0.2.1");
++    ASSERT_EQ(mutable_endpoint.port(), 8443);
++
++    rl->reset_current_srv();
++    ASSERT_FALSE(item->need_srv_resolve());
++    rl->reset_cache();
++    ASSERT_TRUE(item->need_srv_resolve());
++}

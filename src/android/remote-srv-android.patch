@@ -1,0 +1,1037 @@
+diff --git a/main/src/main/cpp/CMakeLists.txt b/main/src/main/cpp/CMakeLists.txt
+index f26c71b..f16de66 100644
+--- a/main/src/main/cpp/CMakeLists.txt
++++ b/main/src/main/cpp/CMakeLists.txt
+@@ -197,6 +197,7 @@ set(openvpn_srcs
+         src/openvpn/shaper.c
+         src/openvpn/sig.c
+         src/openvpn/socket.c
++        src/openvpn/srv.c
+         src/openvpn/socket_util.c
+         src/openvpn/socks.c
+         src/openvpn/ssl.c
+
+diff --git a/main/src/main/cpp/openvpn/src/openvpn/options.c b/main/src/main/cpp/openvpn/src/openvpn/options.c
+index 101f2d4..ac72e0a 100644
+--- a/main/src/main/cpp/openvpn/src/openvpn/options.c
++++ b/main/src/main/cpp/openvpn/src/openvpn/options.c
+@@ -140,6 +140,10 @@ static const char usage_message[] =
+     "                        'all IPv4 addresses' use '0.0.0.0', for 'all IPv6 addresses' use '::'.\n"
+     "                        ``--local`` implies ``--bind``.\n"
+     "--remote host [port] : Remote host name or ip address.\n"
++    "--remote-srv name : Resolve a DNS SRV record before connecting.\n"
++    "                  name is the full query name, e.g. _openvpn._tcp.vpn.example.com.\n"
++    "                  The protocol (_tcp/_udp) and port from the SRV record take\n"
++    "                  precedence over --proto and --port.\n"
+     "--remote-random : If multiple --remote options specified, choose one randomly.\n"
+     "--remote-random-hostname : Add a random string to remote DNS name.\n"
+     "--mode m        : Major mode, m = 'p2p' (default, point-to-point) or 'server'.\n"
+@@ -2204,6 +2208,10 @@ connection_entry_load_re(struct connection_entry *ce, const struct remote_entry
+     {
+         ce->af = re->af;
+     }
++    if (re->is_srv)
++    {
++        ce->remote_is_srv = true;
++    }
+ }
+ 
+ static void
+@@ -6082,6 +6090,7 @@ add_option(struct options *options, char *p[], bool is_inline, const char *file,
+         re.remote = re.remote_port = NULL;
+         re.proto = -1;
+         re.af = 0;
++        re.is_srv = false;
+ 
+         VERIFY_PERMISSION(OPT_P_GENERAL | OPT_P_CONNECTION);
+         re.remote = p[1];
+@@ -6115,6 +6124,30 @@ add_option(struct options *options, char *p[], bool is_inline, const char *file,
+             connection_entry_load_re(&options->ce, &re);
+         }
+     }
++    else if (streq(p[0], "remote-srv") && p[1] && !p[2])
++    {
++        struct remote_entry re;
++        re.remote = re.remote_port = NULL;
++        re.proto = -1;
++        re.af = 0;
++        re.is_srv = true;
++
++        VERIFY_PERMISSION(OPT_P_GENERAL | OPT_P_CONNECTION);
++        re.remote = p[1];
++        if (permission_mask & OPT_P_GENERAL)
++        {
++            struct remote_entry *e = alloc_remote_entry(options, msglevel);
++            if (!e)
++            {
++                goto err;
++            }
++            *e = re;
++        }
++        else if (permission_mask & OPT_P_CONNECTION)
++        {
++            connection_entry_load_re(&options->ce, &re);
++        }
++    }
+     else if (streq(p[0], "resolv-retry") && p[1] && !p[2])
+     {
+         VERIFY_PERMISSION(OPT_P_GENERAL);
+
+diff --git a/main/src/main/cpp/openvpn/src/openvpn/options.h b/main/src/main/cpp/openvpn/src/openvpn/options.h
+index 16cfdb5..f74f7bb 100644
+--- a/main/src/main/cpp/openvpn/src/openvpn/options.h
++++ b/main/src/main/cpp/openvpn/src/openvpn/options.h
+@@ -112,6 +112,7 @@ struct connection_entry
+     bool local_port_defined;
+     const char *remote_port;
+     const char *remote;
++    bool remote_is_srv; /* remote 是 SRV 名称，连接前需解析 */
+     bool remote_float;
+     bool bind_defined;
+     bool bind_ipv6_only;
+@@ -185,6 +186,7 @@ struct remote_entry
+     const char *remote_port;
+     int proto;
+     sa_family_t af;
++    bool is_srv;    /* remote 是 SRV 名称（_service._proto.name），连接前需解析 */
+ };
+ 
+ #define CONNECTION_LIST_SIZE 64
+
+diff --git a/main/src/main/cpp/openvpn/src/openvpn/socket.c b/main/src/main/cpp/openvpn/src/openvpn/socket.c
+index 58ccda9..1a67a13 100644
+--- a/main/src/main/cpp/openvpn/src/openvpn/socket.c
++++ b/main/src/main/cpp/openvpn/src/openvpn/socket.c
+@@ -39,6 +39,7 @@
+ #include "openvpn.h"
+ #include "forward.h"
+ 
++#include "srv.h"
+ #include "memdbg.h"
+ 
+ bool
+@@ -1359,6 +1360,24 @@ link_socket_init_phase1(struct context *c, int sock_index, int mode)
+         proto = o->ce.proto;
+     }
+ 
++    /* 若 remote 是 SRV 名称，每次连接前解析为真实目标主机与端口 */
++    if (o->ce.remote_is_srv && remote_host)
++    {
++        int srv_proto = -1;
++        const char *srv_host = NULL;
++        const char *srv_port = NULL;
++        if (openvpn_resolve_srv(remote_host, &srv_proto, &c->c2.gc, &srv_host, &srv_port))
++        {
++            remote_host = srv_host;
++            remote_port = srv_port;
++            proto = (srv_proto == PROTO_TCP) ? PROTO_TCP_CLIENT : PROTO_UDP;
++        }
++        else
++        {
++            msg(M_WARN, "remote-srv: failed to resolve %s", remote_host);
++        }
++    }
++
+     if (c->mode == CM_CHILD_TCP || c->mode == CM_CHILD_UDP)
+     {
+         struct link_socket *tmp_sock = NULL;
+
+diff --git a/main/src/main/cpp/openvpn/src/openvpn/srv.c b/main/src/main/cpp/openvpn/src/openvpn/srv.c
+new file mode 100644
+index 0000000..cf16a57
+--- /dev/null
++++ b/main/src/main/cpp/openvpn/src/openvpn/srv.c
+@@ -0,0 +1,426 @@
++/*
++ *  OpenVPN -- An application to securely tunnel IP networks
++ *             over a single TCP/UDP port, with support for SSL/TLS-based
++ *             session authentication and key exchange,
++ *             packet encryption, packet authentication, and
++ *             packet compression.
++ *
++ *  Copyright (C) 2002-2026 OpenVPN Inc <sales@openvpn.net>
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2
++ *  as published by the Free Software Foundation.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "syshead.h"
++
++#include "srv.h"
++#include "error.h"
++#include "socket_util.h"
++#include "crypto.h"
++
++#include "memdbg.h"
++
++/* DNS 记录类型常量（避免依赖平台差异的 nameser.h 定义） */
++#define DNS_TYPE_SRV_VALUE 33
++#define DNS_CLASS_IN_VALUE 1
++
++/* 单次查询最多解析的 SRV 记录条数 */
++#define MAX_SRV_RECORDS 16
++
++/* 解析出的一条 SRV 记录 */
++struct srv_record
++{
++    uint16_t priority;
++    uint16_t weight;
++    uint16_t port;
++    char target[256];
++};
++
++/**
++ * 从 `_service._proto.name` 中提取协议，返回 PROTO_UDP 或 PROTO_TCP，
++ * 无法识别时返回 -1。
++ */
++static int
++srv_proto_from_name(const char *srv_name)
++{
++    const char *p1 = strchr(srv_name, '.');
++    if (!p1)
++    {
++        return -1;
++    }
++    const char *p2 = strchr(p1 + 1, '.');
++    if (!p2)
++    {
++        return -1;
++    }
++
++    size_t len = (size_t)(p2 - (p1 + 1));
++    if (len == 4 && strncmp(p1 + 1, "_tcp", 4) == 0)
++    {
++        return PROTO_TCP;
++    }
++    if (len == 4 && strncmp(p1 + 1, "_udp", 4) == 0)
++    {
++        return PROTO_UDP;
++    }
++    return -1;
++}
++
++/**
++ * 按 RFC 2782 的 priority/weight 规则，从候选记录中选出一条。
++ * 返回选中记录的下标，无记录时返回 -1。
++ */
++static int
++select_srv_record(const struct srv_record *records, int count)
++{
++    if (count <= 0)
++    {
++        return -1;
++    }
++
++    /* 找出最低 priority */
++    uint16_t min_priority = records[0].priority;
++    for (int i = 1; i < count; ++i)
++    {
++        if (records[i].priority < min_priority)
++        {
++            min_priority = records[i].priority;
++        }
++    }
++
++    /* 收集最低优先级组 */
++    int index[MAX_SRV_RECORDS];
++    int n = 0;
++    for (int i = 0; i < count; ++i)
++    {
++        if (records[i].priority == min_priority)
++        {
++            index[n++] = i;
++        }
++    }
++
++    /* 计算权重和，权重全零时退化为等概率 */
++    int total_weight = 0;
++    for (int i = 0; i < n; ++i)
++    {
++        total_weight += records[index[i]].weight;
++    }
++    if (total_weight == 0)
++    {
++        return index[(int)(get_random() % n)];
++    }
++
++    /* 加权随机选择 */
++    int pick = (int)(get_random() % total_weight);
++    int acc = 0;
++    for (int i = 0; i < n; ++i)
++    {
++        acc += records[index[i]].weight;
++        if (pick < acc)
++        {
++            return index[i];
++        }
++    }
++    return index[n - 1];
++}
++
++#if defined(_WIN32)
++
++#include <windows.h>
++#include <windns.h>
++
++/**
++ * Windows 实现：使用 DnsQuery_W 查询 SRV 记录。
++ */
++bool
++openvpn_resolve_srv(const char *srv_name, int *proto_out, struct gc_arena *gc,
++                    const char **host_out, const char **port_out)
++{
++    int proto = srv_proto_from_name(srv_name);
++    if (proto < 0)
++    {
++        msg(M_WARN, "remote-srv: bad SRV name (expected _service._tcp._name): %s", srv_name);
++        return false;
++    }
++
++    /* 将 UTF-8 查询名转为宽字符 */
++    int wlen = MultiByteToWideChar(CP_UTF8, 0, srv_name, -1, NULL, 0);
++    if (wlen <= 0)
++    {
++        return false;
++    }
++    wchar_t *wqname = gc_malloc((size_t)wlen * sizeof(wchar_t), false, gc);
++    MultiByteToWideChar(CP_UTF8, 0, srv_name, -1, wqname, wlen);
++
++    PDNS_RECORD result = NULL;
++    DNS_STATUS status = DnsQuery_W(wqname, DNS_TYPE_SRV, DNS_QUERY_STANDARD,
++                                   NULL, &result, NULL);
++    if (status != 0 || !result)
++    {
++        msg(M_WARN, "remote-srv: DnsQuery failed for %s (status %ld)", srv_name, (long)status);
++        return false;
++    }
++
++    /* 收集 SRV 记录 */
++    struct srv_record records[MAX_SRV_RECORDS];
++    int count = 0;
++    for (PDNS_RECORD r = result; r; r = r->pNext)
++    {
++        if (r->wType != DNS_TYPE_SRV || count >= MAX_SRV_RECORDS)
++        {
++            continue;
++        }
++        DNS_SRV_DATA *srv = &r->Data.SRV;
++        records[count].priority = srv->wPriority;
++        records[count].weight = srv->wWeight;
++        records[count].port = srv->wPort;
++        int alen = WideCharToMultiByte(CP_UTF8, 0, srv->pNameTarget, -1,
++                                       records[count].target, sizeof(records[count].target),
++                                       NULL, NULL);
++        if (alen <= 0)
++        {
++            continue;
++        }
++        count++;
++    }
++    DnsRecordListFree(result, DnsFreeRecordList);
++
++    int sel = select_srv_record(records, count);
++    if (sel < 0)
++    {
++        msg(M_WARN, "remote-srv: no SRV records found for %s", srv_name);
++        return false;
++    }
++
++    *proto_out = proto;
++    *host_out = string_alloc(records[sel].target, gc);
++    struct buffer port_buf = alloc_buf_gc(16, gc);
++    buf_printf(&port_buf, "%u", records[sel].port);
++    *port_out = BSTR(&port_buf);
++    return true;
++}
++
++#elif defined(HAVE_RESOLV_H)
++
++/**
++ * 读取 DNS 报文中的 16 位大端无符号整数。
++ */
++static uint16_t
++dns_read_u16(const unsigned char *p)
++{
++    return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++/**
++ * 跳过 DNS 报文中的域名（处理压缩指针），返回域名之后的指针，失败返回 NULL。
++ */
++static const unsigned char *
++dns_skip_name(const unsigned char *msg, const unsigned char *end, const unsigned char *p)
++{
++    while (p < end)
++    {
++        unsigned char c = *p;
++        if (c == 0)
++        {
++            return p + 1;
++        }
++        if ((c & 0xC0) == 0xC0)
++        {
++            if (p + 1 >= end)
++            {
++                return NULL;
++            }
++            return p + 2;
++        }
++        p += 1 + c;
++    }
++    return NULL;
++}
++
++/**
++ * 解析 DNS 报文中的压缩域名，写入 out 缓冲区，返回长度，失败返回 -1。
++ */
++static int
++dns_decode_name(const unsigned char *msg, const unsigned char *end, const unsigned char *p,
++                char *out, size_t outlen)
++{
++    size_t pos = 0;
++    const unsigned char *cur = p;
++    int jumps = 0;
++
++    while (1)
++    {
++        if (cur >= end)
++        {
++            return -1;
++        }
++        unsigned char c = *cur;
++        if (c == 0)
++        {
++            break;
++        }
++        if ((c & 0xC0) == 0xC0)
++        {
++            if (cur + 1 >= end)
++            {
++                return -1;
++            }
++            uint16_t offset = (uint16_t)(((c & 0x3F) << 8) | cur[1]);
++            if (msg + offset >= end)
++            {
++                return -1;
++            }
++            cur = msg + offset;
++            if (++jumps > 32)
++            {
++                return -1;
++            }
++            continue;
++        }
++        if (cur + 1 + c > end)
++        {
++            return -1;
++        }
++        if (pos > 0)
++        {
++            if (pos + 1 >= outlen)
++            {
++                return -1;
++            }
++            out[pos++] = '.';
++        }
++        if (pos + c >= outlen)
++        {
++            return -1;
++        }
++        memcpy(out + pos, cur + 1, c);
++        pos += c;
++        cur += 1 + c;
++    }
++    out[pos] = '\0';
++    return (int)pos;
++}
++
++/**
++ * 从 res_query 返回的原始 DNS 报文中解析 SRV 记录，返回解析条数。
++ */
++static int
++parse_srv_response(const unsigned char *msg, int len,
++                   struct srv_record *records, int max_records)
++{
++    if (len < 12)
++    {
++        return 0;
++    }
++    uint16_t qdcount = dns_read_u16(msg + 4);
++    uint16_t ancount = dns_read_u16(msg + 6);
++
++    const unsigned char *p = msg + 12;
++    const unsigned char *end = msg + len;
++
++    /* 跳过 question section */
++    for (int i = 0; i < qdcount; ++i)
++    {
++        p = dns_skip_name(msg, end, p);
++        if (!p || p + 4 > end)
++        {
++            return 0;
++        }
++        p += 4;
++    }
++
++    /* 遍历 answer section，提取 SRV 记录 */
++    int count = 0;
++    for (int i = 0; i < ancount; ++i)
++    {
++        p = dns_skip_name(msg, end, p);
++        if (!p || p + 10 > end)
++        {
++            return count;
++        }
++        uint16_t type = dns_read_u16(p);
++        uint16_t rdlength = dns_read_u16(p + 8);
++        const unsigned char *rdata = p + 10;
++        if (rdata + rdlength > end)
++        {
++            return count;
++        }
++        p = rdata + rdlength;
++
++        if (type == DNS_TYPE_SRV_VALUE && rdlength >= 7 && count < max_records)
++        {
++            records[count].priority = dns_read_u16(rdata);
++            records[count].weight = dns_read_u16(rdata + 2);
++            records[count].port = dns_read_u16(rdata + 4);
++            int nlen = dns_decode_name(msg, end, rdata + 6,
++                                       records[count].target, sizeof(records[count].target));
++            if (nlen <= 0)
++            {
++                continue;
++            }
++            count++;
++        }
++    }
++    return count;
++}
++
++/**
++ * POSIX 实现：使用 res_query 查询 SRV 记录并手动解析响应。
++ */
++bool
++openvpn_resolve_srv(const char *srv_name, int *proto_out, struct gc_arena *gc,
++                    const char **host_out, const char **port_out)
++{
++    int proto = srv_proto_from_name(srv_name);
++    if (proto < 0)
++    {
++        msg(M_WARN, "remote-srv: bad SRV name (expected _service._tcp._name): %s", srv_name);
++        return false;
++    }
++
++    unsigned char answer[2048];
++    int len = res_query(srv_name, DNS_CLASS_IN_VALUE, DNS_TYPE_SRV_VALUE, answer, sizeof(answer));
++    if (len < 0)
++    {
++        msg(M_WARN, "remote-srv: SRV query failed for %s", srv_name);
++        return false;
++    }
++
++    struct srv_record records[MAX_SRV_RECORDS];
++    int count = parse_srv_response(answer, len, records, MAX_SRV_RECORDS);
++
++    int sel = select_srv_record(records, count);
++    if (sel < 0)
++    {
++        msg(M_WARN, "remote-srv: no SRV records found for %s", srv_name);
++        return false;
++    }
++
++    *proto_out = proto;
++    *host_out = string_alloc(records[sel].target, gc);
++    struct buffer port_buf = alloc_buf_gc(16, gc);
++    buf_printf(&port_buf, "%u", records[sel].port);
++    *port_out = BSTR(&port_buf);
++    return true;
++}
++
++#else /* 平台不支持 SRV 查询（无 DnsQuery 也无 resolv.h） */
++
++bool
++openvpn_resolve_srv(const char *srv_name, int *proto_out, struct gc_arena *gc,
++                    const char **host_out, const char **port_out)
++{
++    (void)srv_name;
++    (void)proto_out;
++    (void)gc;
++    (void)host_out;
++    (void)port_out;
++    return false;
++}
++
++#endif /* _WIN32 / HAVE_RESOLV_H */
+
+diff --git a/main/src/main/cpp/openvpn/src/openvpn/srv.h b/main/src/main/cpp/openvpn/src/openvpn/srv.h
+new file mode 100644
+index 0000000..a2079bf
+--- /dev/null
++++ b/main/src/main/cpp/openvpn/src/openvpn/srv.h
+@@ -0,0 +1,36 @@
++/*
++ *  OpenVPN -- An application to securely tunnel IP networks
++ *             over a single TCP/UDP port, with support for SSL/TLS-based
++ *             session authentication and key exchange,
++ *             packet encryption, packet authentication, and
++ *             packet compression.
++ *
++ *  Copyright (C) 2002-2026 OpenVPN Inc <sales@openvpn.net>
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2
++ *  as published by the Free Software Foundation.
++ */
++
++#ifndef SRV_H
++#define SRV_H
++
++#include "buffer.h"
++
++/**
++ * 解析 DNS SRV 记录，按 priority/weight 规则选出一个目标服务器。
++ *
++ * 仅在每次建立连接前调用一次，把 SRV 名称展开为真实的目标主机名与端口，
++ * 使 OpenVPN 支持形如 `remote-srv _openvpn._tcp.vpn.example.com` 的指令。
++ *
++ * @param srv_name  完整的 SRV 查询名，形如 _service._proto.name
++ * @param proto_out 输出协议（PROTO_UDP 或 PROTO_TCP）
++ * @param gc        用于分配返回字符串的内存 arena
++ * @param host_out  输出目标主机名（gc 分配，调用方不可释放）
++ * @param port_out  输出目标端口字符串（gc 分配）
++ * @return          成功返回 true，失败返回 false
++ */
++bool openvpn_resolve_srv(const char *srv_name, int *proto_out, struct gc_arena *gc,
++                         const char **host_out, const char **port_out);
++
++#endif /* SRV_H */
+
+diff --git a/main/src/main/java/de/blinkt/openvpn/VpnProfile.java b/main/src/main/java/de/blinkt/openvpn/VpnProfile.java
+index d68cf77..6b37c34 100644
+--- a/main/src/main/java/de/blinkt/openvpn/VpnProfile.java
++++ b/main/src/main/java/de/blinkt/openvpn/VpnProfile.java
+@@ -396,6 +396,24 @@ public class VpnProfile implements Serializable, Cloneable {
+         changesLog.add(cle);
+     }
+ 
++    private String getConnectionBlock(Context context, Connection conn, boolean configForOvpn3) {
++        if (conn.mRemoteSrv) {
++            String[] srv = de.blinkt.openvpn.core.SrvResolver.resolve(context, conn.mServerName);
++            if (srv != null) {
++                try {
++                    Connection resolved = conn.clone();
++                    resolved.mRemoteSrv = false;
++                    resolved.mServerName = srv[0];
++                    resolved.mServerPort = srv[1];
++                    resolved.mUseUdp = "udp".equals(srv[2]);
++                    return resolved.getConnectionBlock(configForOvpn3);
++                } catch (CloneNotSupportedException ignored) {
++                }
++            }
++        }
++        return conn.getConnectionBlock(configForOvpn3);
++    }
++
+     public String getConfigFile(Context context, boolean configForOvpn3) {
+         File cacheDir = context.getCacheDir();
+         StringBuilder cfg = new StringBuilder();
+@@ -484,7 +502,7 @@ public class VpnProfile implements Serializable, Cloneable {
+         boolean canUsePlainRemotes = true;
+ 
+         if (mConnections.length == 1) {
+-            cfg.append(mConnections[0].getConnectionBlock(configForOvpn3));
++            cfg.append(getConnectionBlock(context, mConnections[0], configForOvpn3));
+         } else {
+             for (Connection conn : mConnections) {
+                 canUsePlainRemotes = canUsePlainRemotes && conn.isOnlyRemote();
+@@ -496,7 +514,7 @@ public class VpnProfile implements Serializable, Cloneable {
+             if (canUsePlainRemotes) {
+                 for (Connection conn : mConnections) {
+                     if (conn.mEnabled) {
+-                        cfg.append(conn.getConnectionBlock(configForOvpn3));
++                        cfg.append(getConnectionBlock(context, conn, configForOvpn3));
+                     }
+                 }
+             }
+@@ -763,7 +781,7 @@ public class VpnProfile implements Serializable, Cloneable {
+             for (Connection conn : mConnections) {
+                 if (conn.mEnabled) {
+                     cfg.append("<connection>\n");
+-                    cfg.append(conn.getConnectionBlock(configForOvpn3));
++                    cfg.append(getConnectionBlock(context, conn, configForOvpn3));
+                     cfg.append("</connection>\n");
+                 }
+             }
+
+diff --git a/main/src/main/java/de/blinkt/openvpn/core/ConfigParser.java b/main/src/main/java/de/blinkt/openvpn/core/ConfigParser.java
+index 026586d..ecb3ff4 100644
+--- a/main/src/main/java/de/blinkt/openvpn/core/ConfigParser.java
++++ b/main/src/main/java/de/blinkt/openvpn/core/ConfigParser.java
+@@ -898,6 +898,10 @@ public class ConfigParser {
+         // Parse remote config
+         Vector<Vector<String>> remotes = getAllOption("remote", 1, 3);
+ 
++        // Parse remote-srv entries and keep them out of the custom options
++        Vector<Vector<String>> srvRemotes = getAllOption("remote-srv", 1, 1);
++        options.remove("remote-srv");
++
+ 
+ 
+         Vector <String> optionsToRemove = new Vector<>();
+@@ -917,8 +921,10 @@ public class ConfigParser {
+         // Make remotes empty to simplify code
+         if (remotes == null)
+             remotes = new Vector<Vector<String>>();
++        if (srvRemotes == null)
++            srvRemotes = new Vector<Vector<String>>();
+ 
+-        Connection[] connections = new Connection[remotes.size()];
++        Connection[] connections = new Connection[remotes.size() + srvRemotes.size()];
+ 
+ 
+         int i = 0;
+@@ -939,6 +945,17 @@ public class ConfigParser {
+             i++;
+         }
+ 
++        for (Vector<String> srv : srvRemotes) {
++            try {
++                connections[i] = conn.clone();
++            } catch (CloneNotSupportedException e) {
++                e.printStackTrace();
++            }
++            connections[i].mRemoteSrv = true;
++            connections[i].mServerName = srv.get(1);
++            i++;
++        }
++
+         return Pair.create(conn, connections);
+ 
+     }
+
+diff --git a/main/src/main/java/de/blinkt/openvpn/core/Connection.java b/main/src/main/java/de/blinkt/openvpn/core/Connection.java
+index df07189..855236e 100644
+--- a/main/src/main/java/de/blinkt/openvpn/core/Connection.java
++++ b/main/src/main/java/de/blinkt/openvpn/core/Connection.java
+@@ -14,6 +14,7 @@ public class Connection implements Serializable, Cloneable {
+     public String mServerName = "openvpn.example.com";
+     public String mServerPort = "1194";
+     public boolean mUseUdp = true;
++    public boolean mRemoteSrv = false;
+     public String mCustomConfiguration = "";
+     public boolean mUseCustomConfig = false;
+     public boolean mEnabled = true;
+@@ -40,15 +41,21 @@ public class Connection implements Serializable, Cloneable {
+     public String getConnectionBlock(boolean isOpenVPN3) {
+         String cfg = "";
+ 
+-        // Server Address
+-        cfg += "remote ";
+-        cfg += mServerName;
+-        cfg += " ";
+-        cfg += mServerPort;
+-        if (mUseUdp)
+-            cfg += " udp\n";
+-        else
+-            cfg += " tcp-client\n";
++        if (mRemoteSrv) {
++            cfg += "remote-srv ";
++            cfg += mServerName;
++            cfg += "\n";
++        } else {
++            // Server Address
++            cfg += "remote ";
++            cfg += mServerName;
++            cfg += " ";
++            cfg += mServerPort;
++            if (mUseUdp)
++                cfg += " udp\n";
++            else
++                cfg += " tcp-client\n";
++        }
+ 
+         if (mConnectTimeout != 0)
+             cfg += String.format(Locale.US, " connect-timeout  %d\n", mConnectTimeout);
+
+diff --git a/main/src/main/java/de/blinkt/openvpn/core/SrvResolver.java b/main/src/main/java/de/blinkt/openvpn/core/SrvResolver.java
+new file mode 100644
+index 0000000..a163ac4
+--- /dev/null
++++ b/main/src/main/java/de/blinkt/openvpn/core/SrvResolver.java
+@@ -0,0 +1,270 @@
++package de.blinkt.openvpn.core;
++
++import android.content.Context;
++import android.net.ConnectivityManager;
++import android.net.LinkProperties;
++import android.net.Network;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.net.DatagramPacket;
++import java.net.DatagramSocket;
++import java.net.InetAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Random;
++
++/**
++ * Android 端 SRV 记录解析。
++ * Bionic 的 res_query() 依赖已废弃的 net.dns1 属性，在现代 Android 上不可用，
++ * 因此直接从系统当前网络的 DNS 服务器发 UDP 查询。
++ */
++public class SrvResolver {
++
++    private static final int TYPE_SRV = 33;
++
++    private static class Record {
++        int priority;
++        int weight;
++        int port;
++        String target;
++    }
++
++    /**
++     * 解析 _service._proto.name 形式的 SRV 名称。
++     *
++     * @return 长度为 3 的数组 {targetHost, port, "tcp"|"udp"}，失败返回 null
++     */
++    public static String[] resolve(Context context, String srvName) {
++        if (srvName == null) {
++            return null;
++        }
++        String proto = srvProto(srvName);
++        if (proto == null) {
++            return null;
++        }
++
++        try {
++            ConnectivityManager cm =
++                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
++            Network network = cm != null ? cm.getActiveNetwork() : null;
++            if (network == null) {
++                return null;
++            }
++            LinkProperties lp = cm.getLinkProperties(network);
++            if (lp == null) {
++                return null;
++            }
++
++            for (InetAddress server : lp.getDnsServers()) {
++                try {
++                    byte[] answer = query(server, srvName);
++                    List<Record> records = parse(answer);
++                    Record picked = select(records);
++                    if (picked != null) {
++                        return new String[]{picked.target, Integer.toString(picked.port), proto};
++                    }
++                } catch (IOException ignored) {
++                    // 该 DNS 服务器不可达或未返回记录，尝试下一个
++                }
++            }
++        } catch (Exception e) {
++            return null;
++        }
++        return null;
++    }
++
++    private static String srvProto(String name) {
++        int first = name.indexOf('.');
++        if (first < 0) {
++            return null;
++        }
++        int second = name.indexOf('.', first + 1);
++        if (second < 0) {
++            return null;
++        }
++        String p = name.substring(first + 1, second);
++        if ("_tcp".equals(p)) {
++            return "tcp";
++        }
++        if ("_udp".equals(p)) {
++            return "udp";
++        }
++        return null;
++    }
++
++    private static byte[] encodeName(String name) throws IOException {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        for (String label : name.split("\\.")) {
++            byte[] raw = label.getBytes(StandardCharsets.US_ASCII);
++            if (raw.length == 0 || raw.length > 63) {
++                throw new IOException("bad label");
++            }
++            out.write(raw.length);
++            out.write(raw);
++        }
++        out.write(0);
++        return out.toByteArray();
++    }
++
++    private static byte[] query(InetAddress server, String name) throws IOException {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        int id = new Random().nextInt(0xFFFF);
++        out.write(id >> 8);
++        out.write(id & 0xFF);
++        out.write(0x01);            // RD
++        out.write(0x00);
++        out.write(0x00);            // QDCOUNT
++        out.write(0x01);
++        out.write(0x00);            // ANCOUNT
++        out.write(0x00);
++        out.write(0x00);            // NSCOUNT
++        out.write(0x00);
++        out.write(0x00);            // ARCOUNT
++        out.write(0x00);
++        out.write(encodeName(name));
++        out.write(0x00);            // QTYPE
++        out.write(TYPE_SRV);
++        out.write(0x00);            // QCLASS
++        out.write(0x01);
++        byte[] packet = out.toByteArray();
++
++        DatagramSocket socket = new DatagramSocket();
++        try {
++            socket.setSoTimeout(3000);
++            socket.send(new DatagramPacket(packet, packet.length, server, 53));
++            byte[] buf = new byte[4096];
++            DatagramPacket response = new DatagramPacket(buf, buf.length);
++            socket.receive(response);
++            return Arrays.copyOf(response.getData(), response.getLength());
++        } finally {
++            socket.close();
++        }
++    }
++
++    private static int u16(byte[] b, int off) {
++        return ((b[off] & 0xFF) << 8) | (b[off + 1] & 0xFF);
++    }
++
++    private static int skipName(byte[] msg, int p) {
++        int len = msg.length;
++        while (p < len) {
++            int c = msg[p] & 0xFF;
++            if (c == 0) {
++                return p + 1;
++            }
++            if ((c & 0xC0) == 0xC0) {
++                return p + 2;
++            }
++            p += 1 + c;
++        }
++        return -1;
++    }
++
++    private static String decodeName(byte[] msg, int p) {
++        StringBuilder sb = new StringBuilder();
++        int len = msg.length;
++        int jumps = 0;
++        while (p < len) {
++            int c = msg[p] & 0xFF;
++            if (c == 0) {
++                break;
++            }
++            if ((c & 0xC0) == 0xC0) {
++                if (p + 1 >= len) {
++                    return null;
++                }
++                int offset = ((c & 0x3F) << 8) | (msg[p + 1] & 0xFF);
++                if (offset >= len || ++jumps > 32) {
++                    return null;
++                }
++                p = offset;
++                continue;
++            }
++            if (p + 1 + c > len) {
++                return null;
++            }
++            if (sb.length() > 0) {
++                sb.append('.');
++            }
++            sb.append(new String(msg, p + 1, c, StandardCharsets.US_ASCII));
++            p += 1 + c;
++        }
++        return sb.length() == 0 ? null : sb.toString();
++    }
++
++    private static List<Record> parse(byte[] msg) {
++        List<Record> records = new ArrayList<>();
++        if (msg == null || msg.length < 12) {
++            return records;
++        }
++        int qdcount = u16(msg, 4);
++        int ancount = u16(msg, 6);
++        int p = 12;
++        for (int i = 0; i < qdcount; i++) {
++            p = skipName(msg, p);
++            if (p < 0 || p + 4 > msg.length) {
++                return records;
++            }
++            p += 4;
++        }
++        for (int i = 0; i < ancount; i++) {
++            p = skipName(msg, p);
++            if (p < 0 || p + 10 > msg.length) {
++                return records;
++            }
++            int type = u16(msg, p);
++            int rdlength = u16(msg, p + 8);
++            int rdata = p + 10;
++            if (rdata + rdlength > msg.length) {
++                return records;
++            }
++            p = rdata + rdlength;
++            if (type == TYPE_SRV && rdlength >= 7 && records.size() < 16) {
++                Record r = new Record();
++                r.priority = u16(msg, rdata);
++                r.weight = u16(msg, rdata + 2);
++                r.port = u16(msg, rdata + 4);
++                r.target = decodeName(msg, rdata + 6);
++                if (r.target != null) {
++                    records.add(r);
++                }
++            }
++        }
++        return records;
++    }
++
++    /** RFC 2782：最低 priority 组内按 weight 加权随机。 */
++    private static Record select(List<Record> records) {
++        if (records.isEmpty()) {
++            return null;
++        }
++        int minPriority = Integer.MAX_VALUE;
++        for (Record r : records) {
++            minPriority = Math.min(minPriority, r.priority);
++        }
++        List<Record> candidates = new ArrayList<>();
++        int total = 0;
++        for (Record r : records) {
++            if (r.priority == minPriority) {
++                candidates.add(r);
++                total += r.weight;
++            }
++        }
++        Random random = new Random();
++        if (total == 0) {
++            return candidates.get(random.nextInt(candidates.size()));
++        }
++        int pick = random.nextInt(total);
++        int acc = 0;
++        for (Record r : candidates) {
++            acc += r.weight;
++            if (pick < acc) {
++                return r;
++            }
++        }
++        return candidates.get(candidates.size() - 1);
++    }
++}

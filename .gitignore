@@ -1,0 +1,11 @@
+# 构建临时目录（数 GB，勿入库）
+.tmp-build/
+
+# 上游 OpenVPN 源码（独立 git 仓库，仅本地对照/生成补丁用）
+openvpn-upstream/
+
+# 本地临时文件
+.screenshots/
+*.o
+*.obj
+*.log
